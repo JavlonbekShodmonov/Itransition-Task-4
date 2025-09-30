@@ -2,9 +2,18 @@
 import readline from "readline";
 import Table from "cli-table3";
 import chalk from "chalk";
-import { MortyBase, GameContext, FairRandomFn } from "./morties/MortyBase";
+import { MortyBase, GameContext } from "./morties/MortyBase";
 import { FairGenerator } from "./FairGenerator";
 import { Statistics } from "./Statistics";
+
+type PendingCommit = {
+  id: number;
+  label?: string;
+  range: number;
+  commit: { mortyValue: number; hmacHex: string; keyHex: string };
+  rickValue: number;
+  final: number;
+};
 
 export class GameCore {
   private morty: MortyBase;
@@ -13,6 +22,7 @@ export class GameCore {
   private rl: readline.Interface;
   private maxRounds?: number;
   private commitCounter = 0;
+  private pendingCommits: PendingCommit[] = [];
 
   constructor(boxes: number, morty: MortyBase, maxRounds?: number) {
     this.boxes = boxes;
@@ -26,23 +36,25 @@ export class GameCore {
     return new Promise((resolve) => this.rl.question(prompt, (ans) => resolve(ans.trim())));
   }
 
-  // Implements the HMAC-based collaborative protocol:
-  // - create commit (morty value + key), show HMAC
-  // - ask Rick for his number in [0, range)
-  // - compute final = (morty + rick) % range
-  // - reveal mortyValue + key and show check
-  private async fairRandom(range: number, label?: string): Promise<{
-    final: number;
-    mortyValue: number;
-    keyHex: string;
-    hmacHex: string;
-    rickValue: number;
-  }> {
+  /**
+   * fairRandom(range, label)
+   *
+   * - Create Morty's commit (mortyValue + key, compute HMAC)
+   * - Display HMAC only
+   * - Ask Rick for his number in [0, range)
+   * - Compute final = (morty + rick) % range
+   * - Store commit (without revealing mortyValue/key) into pendingCommits
+   * - Return full FairRandomResult object
+   */
+  private async fairRandom(range: number, label?: string) {
     const commit = FairGenerator.createCommit(range);
     this.commitCounter++;
-    console.log(chalk.gray(`Morty HMAC${this.commitCounter}=${commit.hmacHex}`));
+    const id = this.commitCounter;
 
-    // ask user for Rick's number in [0, range)
+    // Show only HMAC to Rick
+    console.log(chalk.gray(`Morty HMAC${id}=${commit.hmacHex}`));
+
+    // Ask Rick for a number in the same range
     let rickNum: number | null = null;
     while (rickNum === null) {
       const ans = await this.question(`Rick, enter your number [0,${range}): `);
@@ -54,22 +66,54 @@ export class GameCore {
       }
     }
 
+    // Compute collaborative result
     const final = FairGenerator.combine(commit.mortyValue, rickNum, range);
 
-    console.log(chalk.gray(`Morty: Aww man, my random value is ${commit.mortyValue}.`));
-    console.log(chalk.gray(`Morty KEY=${commit.keyHex}`));
-    const verify = FairGenerator.verify(commit.mortyValue, commit.keyHex);
-    console.log(chalk.gray(`Check HMAC: ${verify === commit.hmacHex ? "OK" : "MISMATCH"}`));
+    // Save commit for reveal later (do NOT reveal key or mortyValue now)
+    this.pendingCommits.push({
+      id,
+      label,
+      range,
+      commit,
+      rickValue: rickNum,
+      final,
+    });
 
-    return { final, mortyValue: commit.mortyValue, keyHex: commit.keyHex, hmacHex: commit.hmacHex, rickValue: rickNum };
+    // ✅ Return the full FairRandomResult object
+    return {
+      final,
+      mortyValue: commit.mortyValue,
+      keyHex: commit.keyHex,
+      hmacHex: commit.hmacHex,
+      rickValue: rickNum,
+    };
+  }
+
+  /**
+   * Reveal and verify all pending commits (called once per round, after player finalizes choices)
+   * This prints Morty's original mortyValue and key, and verifies HMAC.
+   */
+  private revealAndVerifyCommits() {
+    if (this.pendingCommits.length === 0) return;
+
+    for (const pc of this.pendingCommits) {
+      console.log(chalk.gray(`Morty: Aww man, my ${pc.label ?? ""} random value is ${pc.commit.mortyValue}.`));
+      console.log(chalk.gray(`Morty KEY${pc.id}=${pc.commit.keyHex}`));
+      const recomputed = FairGenerator.verify(pc.commit.mortyValue, pc.commit.keyHex);
+      console.log(chalk.gray(`Morty: So the fair number is (${pc.commit.mortyValue} + ${pc.rickValue}) % ${pc.range} = ${pc.final}`));
+      console.log(chalk.gray(`Check HMAC${pc.id}: ${recomputed === pc.commit.hmacHex ? "OK" : "MISMATCH"}`));
+    }
+
+    // Clear pending commits for next round
+    this.pendingCommits = [];
   }
 
   private async oneRound(): Promise<void> {
     console.log(chalk.yellow(`\nMorty: I'm gonna hide your portal gun in one of the ${this.boxes} boxes.`));
 
     // 1) collaborative generation for portal box
-    const portalCommit = await this.fairRandom(this.boxes, "portal");
-    const portalIndex = portalCommit.final;
+    const portalResult = await this.fairRandom(this.boxes, "portal");
+    const portalIndex = portalResult.final;
 
     // 2) Rick chooses a box (his guess)
     let guess: number | null = null;
@@ -85,6 +129,7 @@ export class GameCore {
       boxes: this.boxes,
       chosenByRick: guess,
       portalBox: portalIndex,
+      // expose fairRandom so Morties MUST use GameCore's collaborative PRNG
       fairRandom: (range: number, label?: string) => this.fairRandom(range, label),
       stats: this.stats,
     };
@@ -93,7 +138,7 @@ export class GameCore {
     // ensure at least the player's pick is in remaining
     if (!remaining.includes(guess)) remaining.push(guess);
 
-    // If more than 2 left, keep first two (shouldn't normally happen)
+    // If more than 2 left, keep first two (defensive fallback)
     const two = (remaining.length >= 2) ? remaining.slice(0, 2) : remaining.concat([]).slice(0, 2);
 
     console.log(chalk.yellow(`Morty: I removed ${this.boxes - two.length} boxes. Remaining boxes: ${two.join(", ")}`));
@@ -108,10 +153,15 @@ export class GameCore {
       if (other !== undefined) finalBox = other;
     }
 
+    // 5) Now reveal all Morty's commits for this round
+    this.revealAndVerifyCommits();
+
+    // 6) Announce result
     const rickWon = finalBox === portalIndex;
     console.log(chalk.blue(`Morty: The portal gun is in the box ${portalIndex}.`));
-    console.log(chalk.blue(rickWon ? "Morty: Aww man, you won, Rick!" : "Morty: Aww man, you lost, Rick."));
+    console.log(chalk.blue(rickWon ? "Morty: Aww man, you won, Rick!" : "Morty: Aww man, you lost, Rick." ));
 
+    // 7) Record stats
     this.stats.addRound(switched, rickWon);
   }
 
