@@ -79,7 +79,6 @@ export class GameCore {
       final,
     });
 
-    // ✅ Return the full FairRandomResult object
     return {
       final,
       mortyValue: commit.mortyValue,
@@ -124,21 +123,21 @@ export class GameCore {
       else console.log(chalk.red("Invalid guess."));
     }
 
-    // 3) Morty decides which boxes to leave (may call fairRandom again via context)
+    // 3) Morty decides which boxes to leave (must use GameCore’s fairRandom)
     const context: GameContext = {
       boxes: this.boxes,
       chosenByRick: guess,
       portalBox: portalIndex,
-      // expose fairRandom so Morties MUST use GameCore's collaborative PRNG
       fairRandom: (range: number, label?: string) => this.fairRandom(range, label),
       stats: this.stats,
     };
 
     const remaining = await this.morty.revealBoxes(context);
-    // ensure at least the player's pick is in remaining
+
+    // defensive: always include Rick’s pick
     if (!remaining.includes(guess)) remaining.push(guess);
 
-    // If more than 2 left, keep first two (defensive fallback)
+    // ensure only 2 left
     const two = (remaining.length >= 2) ? remaining.slice(0, 2) : remaining.concat([]).slice(0, 2);
 
     console.log(chalk.yellow(`Morty: I removed ${this.boxes - two.length} boxes. Remaining boxes: ${two.join(", ")}`));
@@ -188,7 +187,6 @@ export class GameCore {
       roundsDone++;
       if (this.maxRounds && roundsDone >= this.maxRounds) break;
 
-      // if maxRounds not set, ask whether to continue
       if (!this.maxRounds) {
         const again = await this.question("Do you want to play another round (y/n)? ");
         if (!/^y(es)?$/i.test(again)) break;
